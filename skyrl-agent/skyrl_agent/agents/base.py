@@ -221,6 +221,7 @@ class AgentRunner:
                     debug_log=debug_log,
                     early_step_threshold=self.cfg.generator.get("early_step_threshold", 0),
                     enable_turn_reminder=enable_turn_reminder,
+                    bfcl_tool_params_path=self.cfg.generator.get("bfcl_tool_params_path", None),
                 )
                 traj: BaseTrajectory = self.traj_cls(
                     cfg=traj_cfg,
@@ -404,7 +405,13 @@ class AgentRunner:
                 continue
 
             # step-level results
+            if getattr(self.infer_engine, "use_chat_api", False):
+                steps_per_trajectory.append(0)
+                continue
             data_list = transitions_to_training_data(transitions)
+            if not data_list:
+                steps_per_trajectory.append(0)
+                continue
             for data in data_list:
                 prompt_input_ids.append(data.input_tokens)
                 response_ids.append(data.response_tokens)

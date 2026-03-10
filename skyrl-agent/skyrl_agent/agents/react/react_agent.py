@@ -35,8 +35,6 @@ from .messages import (
     get_turn_reminder_text,
 )
 from skyrl_agent.functional.function_calling import convert_fncall_messages_to_non_fncall_messages
-from .bfcl_backend_config import CLASS_FILE_PATH_MAPPING
-from .bfcl_multi_turn_utils import execute_multi_turn_func_call
 
 
 class ReActAgent:
@@ -46,6 +44,7 @@ class ReActAgent:
         infer_engine: AsyncInferBackend,
         tokenizer: Any,
     ) -> None:
+        self.cfg = traj_config
         self.tokenizer = tokenizer
         self.infer_engine = infer_engine
         self.sampling_params = traj_config.sampling_params
@@ -73,13 +72,14 @@ class ReActAgent:
         self.message_encoder = MessageEncoder(
             tokenizer, qwen3_enable_thinking=self.qwen3_enable_thinking, qwen3_acc_thinking=self.qwen3_acc_thinking
         )
-        
-        # Tool buffer
-        self.tool_buffer = []
-        self.tool_buffer_max_size = 10
-        self._bfcl_instance_store = {}
-        self.bfcl_tool_params: List[Dict[str, Any]] = self._load_bfcl_tool_params()
-        
+
+        self._active_bfcl_tool_params: List[Dict[str, Any]] = []
+        self._bfcl_recorded_calls: List[Dict[str, Any]] = []  # Track BFCL function calls for evaluation
+        self.bfcl_tool_params: List[Dict[str, Any]] = self._load_bfcl_tool_params(
+            getattr(traj_config, "bfcl_tool_params_path", None)
+        )
+        self._active_bfcl_tool_params = self.bfcl_tool_params
+
         # In-context
         self.put_tools_in_context = True
 
@@ -158,87 +158,33 @@ class ReActAgent:
         # Determine if we should retokenize everything or use incremental encoding
         is_prompt = len(self.history) == 2  # system + user (with reminder appended)
         should_retokenize = is_prompt or history_was_reset or not self.transitions
+        active_tool_params = self._get_active_tool_params()
 
         if should_retokenize:
             # Retokenize everything (first message or after history reset)
             input_ids = self.message_encoder.encode_messages(
                 self.history.messages,
-                self.tool_params,
+                active_tool_params,
                 is_first_message=True,
             )
             self.prompt_token_len = len(input_ids)
         else:
             # Incremental encoding: append new messages to existing tokens
-            # TODO(@csy): Handle nested agent scenarios
-            # When tools spawn subagents that also use LLM generation, self.transitions[-1]
-            # may belong to a subagent rather than this agent, breaking incremental encoding.
-            # Proposed solution: Filter transitions by agent_id:
-            #   own_transitions = [t for t in self.transitions if getattr(t, 'agent_id', None) == self.agent_id]
-            #   last_transition = own_transitions[-1] if own_transitions else None
-            #   If last_transition is None, fallback to retokenizing everything.
             last_transition = self.transitions[-1]
             if not last_transition.ac.token_ids:
                 # Retokenize the action response_str if serving endpoints do not return token_ids
                 message = [{"role": "assistant", "content": last_transition.ac.text}]
                 last_transition.ac.token_ids = self.message_encoder.encode_messages(
-                    message, self.tool_params, add_generation=False
+                    message, active_tool_params, add_generation=False
                 )
 
             # Encode only the new observation message(s)
-            # Simple default behavior: assuming one env observation message per step
-            # Can be overridden by subclasses
             new_obs_ids = self.message_encoder.encode_messages(
-                [self.history.messages[-1]], self.tool_params, add_generation=True
+                [self.history.messages[-1]], active_tool_params, add_generation=True
             )
 
             # Build input_ids incrementally: previous observation + previous action + new observation
             input_ids = last_transition.ob.input_ids + last_transition.ac.token_ids + new_obs_ids
-
-        self.response_token_len = len(input_ids) - self.prompt_token_len
-
-        # Prepare sampling params
-        sampling_params = copy.deepcopy(self.sampling_params)
-        sampling_params["max_tokens"] = self.max_prompt_length - self.response_token_len
-
-        return input_ids, sampling_params
-
-    def _prepare_llm_input_deprecated(self) -> tuple[List[int], Dict]:
-        """[DEPRECATED] Prepare input_ids and sampling params for LLM.
-
-        This is an old version that performs retokenization at every turn.
-        This method is deprecated and will be removed in a future version.
-        Use `_prepare_llm_input()` instead.
-
-        Returns:
-            Tuple of (input_ids, sampling_params)
-        """
-
-        # Check if history was reset - store flag before clearing it
-        history_was_reset = self.history.was_reset()
-        if history_was_reset:
-            self.prompt_token_len = 0
-            self.history.clear_reset_flag()
-
-        # Track token lengths
-        # Encode messages to input_ids
-        if self.enable_turn_reminder:
-            remaining_steps = self.max_iterations - self.step_count + 1
-            reminder_text = get_turn_reminder_text(
-                self.step_count,
-                remaining_steps,
-                early_step_threshold=self.early_step_threshold,
-            )
-            self.history.add_turn_reminder(reminder_text)
-
-        input_ids = self.message_encoder.encode_messages(
-            self.history.messages,
-            self.tool_params,
-            is_first_message=True,
-        )
-        # Set prompt_token_len on first message (initial setup) or after history reset
-        is_prompt = len(self.history) == 2  # system + user (possibly with reminder appended)
-        if is_prompt or history_was_reset:
-            self.prompt_token_len = len(input_ids)
 
         self.response_token_len = len(input_ids) - self.prompt_token_len
 
@@ -326,111 +272,139 @@ class ReActAgent:
             print(f"[Agent Step Error] Error appending tool output to messages: {str(e)}")
             self.history.add_tool_error(str(e), tool_call_id)
 
-    def _format_tool_buffer_prompt(self) -> str:
-        return json.dumps({"tool_buffer": self.tool_buffer})
-
-    def _sync_tool_buffer_prompt(self) -> None:
-        """
-        Ensure the tool buffer is in context immediately after the system prompt.
-        If no system prompt exists, insert at the beginning.
-        """
-        if self.tool_buffer_max_size <= 0:
-            return
-        buffer_msg = {"role": "system", "content": self._format_tool_buffer_prompt()}
-        messages = self.history.messages
-
-        if not messages:
-            self.history.messages = [buffer_msg]
-            return
-
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "system":
-                insert_idx = idx + 1
-                if (
-                    insert_idx < len(messages)
-                    and messages[insert_idx].get("role") == "system"
-                    and messages[insert_idx].get("content", "").startswith('{"tool_buffer"')
-                ):
-                    messages[insert_idx]["content"] = buffer_msg["content"]
-                else:
-                    messages.insert(insert_idx, buffer_msg)
-                return
-
-        messages.insert(0, buffer_msg)
-
-    def _load_bfcl_tool_params(self) -> List[Dict[str, Any]]:
+    def _load_bfcl_tool_params(self, path: str | None) -> List[Dict[str, Any]]:
         default_path = os.path.join(os.path.dirname(__file__), "..", "tools", "bfcl_tool_params.json")
-        path = os.path.abspath(self.cfg.get("bfcl_tool_params_path", default_path))
+        if not path:
+            path = default_path
+        path = os.path.abspath(path)
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
+                return json.load(f)
         except Exception:
-            pass
-        return []
+            return []
 
-    def _build_bfcl_func_call(self, tool_name: str, tool_args: Any) -> str:
-        if tool_args is None:
-            args = {}
-        elif isinstance(tool_args, str):
+    def _normalize_bfcl_function_entry(self, entry: Dict[str, Any]) -> Dict[str, Any] | None:
+        """Normalize BFCL function schema into OpenAI function-tool format."""
+        if not isinstance(entry, dict):
+            return None
+
+        # Already in OpenAI function-tool format.
+        if entry.get("type") == "function" and isinstance(entry.get("function"), dict):
+            fn = entry["function"]
+            if isinstance(fn.get("name"), str):
+                return entry
+            return None
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        params = entry.get("parameters", {})
+        if not isinstance(params, dict):
+            params = {"type": "object", "properties": {}, "required": []}
+        if params.get("type") == "dict" or not isinstance(params.get("type"), str):
+            params = copy.deepcopy(params)
+            params["type"] = "object"
+        if not isinstance(params.get("properties"), dict):
+            params = copy.deepcopy(params)
+            params["properties"] = {}
+        if not isinstance(params.get("required"), list):
+            params = copy.deepcopy(params)
+            params["required"] = []
+
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": entry.get("description", ""),
+                "parameters": params,
+            },
+        }
+
+    def _resolve_bfcl_tool_params_from_instance(self, instance: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+        """Prefer per-instance BFCL function schema when available."""
+        if instance is None or not hasattr(instance, "get"):
+            return self.bfcl_tool_params
+
+        raw = instance.get("function")
+        if raw is None:
+            return self.bfcl_tool_params
+        if isinstance(raw, str):
             try:
-                args = json.loads(tool_args)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"BFCL tool arguments must be valid JSON: {str(e)}") from e
-        elif isinstance(tool_args, dict):
-            args = tool_args
-        else:
-            raise ValueError(f"Unsupported BFCL tool arguments type: {type(tool_args)}")
+                raw = json.loads(raw)
+            except Exception:
+                return self.bfcl_tool_params
 
-        args_str = ", ".join(f"{key}={repr(value)}" for key, value in args.items())
-        return f"{tool_name}({args_str})"
+        if isinstance(raw, dict):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return self.bfcl_tool_params
 
-    def _run_bfcl_call(self, tool_name: str, tool_args: Any) -> Any:
-        func_call = self._build_bfcl_func_call(tool_name, tool_args)
-        involved_classes = list(CLASS_FILE_PATH_MAPPING.keys())
-        initial_config = {}
-        model_name = getattr(self.infer_engine, "model_name", "react_agent")
-        test_entry_id = self.instance_id or self.trajectory_id or "default"
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        for item in raw:
+            norm = self._normalize_bfcl_function_entry(item)
+            if not norm:
+                continue
+            name = norm["function"]["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            normalized.append(norm)
 
-        if isinstance(getattr(self, "instance", None), dict):
-            initial_config = self.instance.get("bfcl_initial_config", initial_config)
-            involved_classes = self.instance.get("bfcl_involved_classes", involved_classes)
-            model_name = self.instance.get("bfcl_model_name", model_name)
-            test_entry_id = self.instance.get("bfcl_test_entry_id", test_entry_id)
+        return normalized if normalized else self.bfcl_tool_params
 
-        results, _ = execute_multi_turn_func_call(
-            func_call_list=[func_call],
-            initial_config=initial_config,
-            involved_classes=involved_classes,
-            model_name=str(model_name),
-            test_entry_id=str(test_entry_id),
-            long_context=False,
-            is_evaL_run=False,
-            instance_store=self._bfcl_instance_store,
-        )
-        return results[0] if results else ""
+    def _get_active_tool_params(self) -> List[Dict[str, Any]]:
+        """Return tool schema exposed to model/parser for this run."""
+        merged: List[Dict[str, Any]] = list(self.tool_params)
+        seen_names = set()
+        for tp in merged:
+            fn = tp.get("function") if isinstance(tp, dict) else None
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if isinstance(name, str):
+                seen_names.add(name)
+
+        for tp in self._active_bfcl_tool_params:
+            if not isinstance(tp, dict):
+                continue
+            fn = tp.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if not isinstance(name, str) or name in seen_names:
+                continue
+            seen_names.add(name)
+            merged.append(tp)
+        return merged
+
+    def _is_parallel_bfcl(self) -> bool:
+        """Return True if this is a parallel BFCL category (needs multiple calls per turn)."""
+        inst = getattr(self, "instance", None)
+        if inst is None:
+            return False
+        _get = inst.get if hasattr(inst, "get") else lambda k, d=None: getattr(inst, k, d)
+        entry_id = str(_get("id", "") or "")
+        cat = entry_id.rsplit("_", 1)[0] if entry_id else ""
+        _PARALLEL_CATEGORIES = {"parallel", "parallel_multiple", "live_parallel", "live_parallel_multiple"}
+        return cat in _PARALLEL_CATEGORIES
 
     async def _execute_bfcl_tool(self, tool_name: str, tool_args: Any, tool_call_id: str) -> Any:
+        """Execute a BFCL single-turn function call.
+
+        For single-turn tasks the function call format is what matters for evaluation
+        (AST checker), not the execution result. We record the call and return a
+        success acknowledgement so the model can proceed or stop.
+        """
         try:
-            output = await call_sync_from_async(
-                self._run_bfcl_call,
-                tool_name,
-                tool_args,
-                agent=self,
-                trajectory_id=self.trajectory_id,
+            args_display = json.dumps(tool_args) if isinstance(tool_args, dict) else str(tool_args)
+            return json.dumps(
+                {
+                    "status": "success",
+                    "function": tool_name,
+                    "arguments": tool_args if isinstance(tool_args, dict) else str(tool_args),
+                    "message": (
+                        f"Function {tool_name}({args_display}) called successfully. "
+                        "If there are more required calls, make them now. Otherwise stop."
+                    ),
+                }
             )
-
-            if self._profile_enabled:
-                try:
-                    self._tool_calls_total += 1
-                    if tool_name:
-                        self._tool_calls_by_name[tool_name] += 1
-                except Exception:
-                    pass
-
-            return output
-
         except Exception as e:
             error_str = str(e)
             try:
@@ -439,44 +413,12 @@ class ReActAgent:
                 self.history.add_tool_error("Tool failed with an exception.", tool_call_id)
             self.history.add_user_guidance(TOOL_INVOCATION_ERROR_GUIDANCE)
             raise ToolExecutionFailed()
+
     def _add_loaded_tools_to_buffer(self, output: Any) -> None:
-        if self.tool_buffer_max_size <= 0:
-            return
-        if not isinstance(output, dict):
-            return
-        tools = output.get("tools")
-        if not isinstance(tools, list):
-            return
-
-        for tool in tools:
-            if isinstance(tool, dict):
-                self.tool_buffer.append(tool)
-
-        self._sync_tool_buffer_prompt()
-
-        overflow = len(self.tool_buffer) - self.tool_buffer_max_size
-        if overflow > 0:
-            guidance = (
-                "Tool buffer exceeded max size. "
-                f"Please call evict with tool_names to remove at least {overflow} tools."
-            )
-            self.history.add_user_guidance(guidance)
+        return
 
     def _evict_tools_from_buffer(self, output: Any) -> None:
-        if self.tool_buffer_max_size <= 0:
-            return
-        if not isinstance(output, dict):
-            return
-        tool_names = output.get("tool_names")
-        if not isinstance(tool_names, list):
-            return
-        if not tool_names:
-            return
-
-        self.tool_buffer = [
-            tool for tool in self.tool_buffer if not (isinstance(tool, dict) and tool.get("name") in tool_names)
-        ]
-        self._sync_tool_buffer_prompt()
+        return
 
     async def step(self):
         """Execute one agent step: LLM generation -> tool call -> tool execution.
@@ -493,7 +435,9 @@ class ReActAgent:
             # 1. Prepare LLM input
             if getattr(self.infer_engine, "use_chat_api", False):
                 sampling_params = copy.deepcopy(self.sampling_params)
-                messages = convert_fncall_messages_to_non_fncall_messages(self.history.messages, self.tool_params)
+                messages = convert_fncall_messages_to_non_fncall_messages(
+                    self.history.messages, self._get_active_tool_params()
+                )
                 input_ids = []
             else:
                 input_ids, sampling_params = self._prepare_llm_input()
@@ -523,21 +467,34 @@ class ReActAgent:
                 raise ContextWindowExceeded()
 
             # 3. Parse tool call from response
-            parse_tool_params = self.tool_params + self.bfcl_tool_params
+            parse_tool_params = self._get_active_tool_params()
             tool_call, parse_error = parse_tool_call(response_str, parse_tool_params)
+
+            # Determine if this is a BFCL-only run (no registered tools like finish)
+            has_bfcl_tools = bool(self._active_bfcl_tool_params)
+            has_registered_tools = bool(self.tools)
 
             # Handle parse error
             if parse_error:
-                self._handle_parse_error(parse_error)
-
-            # Handle no tools scenario
-            if not self.tools:
-                print(f"[Agent Step {self.step_count}] No tools provided, returning response.")
-                result = StepResult.finished("FINISH", response_str)
+                # For BFCL tasks without registered tools, parse errors on non-function-call
+                # output just mean the model is done (BFCL style: no function call = turn over).
+                if has_bfcl_tools and not has_registered_tools:
+                    print(f"[Agent Step {self.step_count}] BFCL: model output is not a function call, stopping.")
+                    result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
+                else:
+                    self._handle_parse_error(parse_error)
 
             # Handle no tool call detected
             elif tool_call is None:
-                self._handle_no_tool_call(response_str)
+                if has_bfcl_tools and not has_registered_tools:
+                    # BFCL style: no function call output = turn/task is done
+                    print(f"[Agent Step {self.step_count}] BFCL: no function call detected, stopping.")
+                    result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
+                elif not has_registered_tools and not has_bfcl_tools:
+                    print(f"[Agent Step {self.step_count}] No tools provided, returning response.")
+                    result = StepResult.finished("FINISH", response_str)
+                else:
+                    self._handle_no_tool_call(response_str)
 
             else:
                 # 4. Extract tool information
@@ -553,6 +510,19 @@ class ReActAgent:
                         output = await self._execute_tool(tool_name, tool_args, tool_call_id)
                 else:
                     output = await self._execute_bfcl_tool(tool_name, tool_args, tool_call_id)
+                    # Record the BFCL function call for evaluation
+                    recorded_args = tool_args
+                    if isinstance(recorded_args, str):
+                        try:
+                            recorded_args = json.loads(recorded_args)
+                        except Exception:
+                            recorded_args = {}
+                    if not isinstance(recorded_args, dict):
+                        recorded_args = {}
+                    self._bfcl_recorded_calls.append({
+                        "function": tool_name,
+                        "arguments": recorded_args,
+                    })
 
                 if tool_name in {"load", "evict", "finish"} and tool_name not in self.tools:
                     pass
@@ -561,12 +531,17 @@ class ReActAgent:
                     print(f"[Agent Step {self.step_count}] Finish tool called. Stopping agent.")
                     result = StepResult.finished("FINISH_TOOL", output)
                 else:
-                    # Continue agent loop
-                    result = StepResult.continuing(response_str)
+                    # For non-parallel BFCL categories (simple, multiple, …):
+                    # stop immediately after the first function call.
+                    # For parallel categories (parallel, parallel_multiple, …):
+                    # continue until the model stops on its own.
+                    if has_bfcl_tools and not has_registered_tools and not self._is_parallel_bfcl():
+                        print(f"[Agent Step {self.step_count}] BFCL single-step: stopping after first call.")
+                        result = StepResult.finished("BFCL_SINGLE_TURN_DONE", self._bfcl_recorded_calls)
+                    else:
+                        result = StepResult.continuing(response_str)
 
                     # 7. Append tool output to history only if output is not None
-                    # Some tools (like next_with_summary) embed feedback in user message
-                    # and return None to skip adding tool output
                     if output is not None:
                         print(f"[Tool Output step {self.step_count}] {output}")
                         self._append_tool_output(output, tool_call_id)
@@ -590,10 +565,18 @@ class ReActAgent:
         return result.to_tuple()
 
     async def run(self, instruction: List[Dict], instance: Dict | None = None) -> List[str]:
-        """Run the agent till the end with the provided user input.
+        """Run the agent to completion with the provided user input.
+
         Optionally accepts an instance payload for tools (stored on self.instance).
+        Only single-turn execution is supported.
         """
         self.instance = instance
+        self._active_bfcl_tool_params = self._resolve_bfcl_tool_params_from_instance(instance)
+
+        has_bfcl_tools = bool(self._active_bfcl_tool_params)
+        has_registered_tools = bool(self.tools)
+        is_bfcl_single_turn = has_bfcl_tools and not has_registered_tools
+
         self._init_message(instruction)
         result = None
         finish_reason = None
@@ -605,16 +588,21 @@ class ReActAgent:
             except Exception as e:
                 finish_reason = f"error: {str(e)}"
                 print(f"[Agent Run Error] Exception during step: {str(e)}")
-                # traceback
                 print(traceback.format_exc())
                 break
-        else:  # If we exit the loop without hitting a break, it means we reached max iterations
+        else:
             finish_reason = "max_iterations_reached"
 
+        # Normalise BFCL finish reasons
+        if is_bfcl_single_turn and finish_reason in ("BFCL_TURN_DONE", "BFCL_SINGLE_TURN_DONE"):
+            finish_reason = "BFCL_SINGLE_TURN_DONE"
+            result = self._bfcl_recorded_calls
+
+        print("[Agent Run] Final messages:", self.get_messages())
         return finish_reason, result
 
     def get_messages(self) -> List[dict]:
-        return convert_fncall_messages_to_non_fncall_messages(self.history.messages, self.tool_params)
+        return convert_fncall_messages_to_non_fncall_messages(self.history.messages, self._get_active_tool_params())
 
     def get_transitions(self) -> List[Transition]:
         """Return the list of transitions recorded during agent execution.
@@ -669,9 +657,11 @@ class ReActAgent:
 
             self.history.initialize(processed_instruction)
         else:
-            self.history.initialize(instruction)
-
-        self._sync_tool_buffer_prompt()
+            # Ensure a system message exists so tool descriptions can be appended later
+            processed_instruction = copy.deepcopy(instruction)
+            if not any(msg.get("role") == "system" for msg in processed_instruction):
+                processed_instruction.insert(0, {"role": "system", "content": ""})
+            self.history.initialize(processed_instruction)
 
     # Expose profiling snapshot for upstream aggregation
     def get_tool_profile(self) -> Dict[str, Any]:

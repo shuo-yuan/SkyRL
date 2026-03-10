@@ -76,7 +76,7 @@ Reminder:
 - Required parameters MUST be specified
 - Only call one function at a time
 - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after.
-- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+- If functions are provided, you MUST call the relevant function(s) to complete the task; do NOT answer from your own knowledge
 </IMPORTANT>
 """
 
@@ -284,20 +284,53 @@ def _extract_and_validate_params(matching_tool: dict, param_matches: Iterable[re
             )
 
         # Validate and convert parameter type
-        # supported: string, integer, array
+        # supported: string, integer, float, number, boolean, array, dict/object
         if param_name in param_name_to_type:
-            if param_name_to_type[param_name] == "integer":
+            ptype = param_name_to_type[param_name]
+            if ptype == "integer":
                 try:
                     param_value = int(param_value)
-                except ValueError:
+                except (ValueError, TypeError):
                     raise FunctionCallValidationError(f"Parameter '{param_name}' is expected to be an integer.")
-            elif param_name_to_type[param_name] == "array":
+            elif ptype in ("float", "number"):
+                try:
+                    param_value = float(param_value)
+                except (ValueError, TypeError):
+                    raise FunctionCallValidationError(f"Parameter '{param_name}' is expected to be a float.")
+            elif ptype == "boolean":
+                if isinstance(param_value, str):
+                    if param_value.lower() in ("true", "yes", "1"):
+                        param_value = True
+                    elif param_value.lower() in ("false", "no", "0"):
+                        param_value = False
+                    # else leave as string and let the checker handle it
+            elif ptype in ("array", "tuple"):
                 try:
                     param_value = json.loads(param_value)
                 except json.JSONDecodeError:
-                    raise FunctionCallValidationError(f"Parameter '{param_name}' is expected to be an array.")
+                    # Fallback: Python-style list/tuple repr (single quotes)
+                    import ast as _ast
+                    try:
+                        parsed = _ast.literal_eval(param_value)
+                        # Normalise tuple → list (BFCL ast_checker maps tuple → list)
+                        param_value = list(parsed) if isinstance(parsed, tuple) else parsed
+                    except Exception:
+                        raise FunctionCallValidationError(f"Parameter '{param_name}' is expected to be an array/tuple.")
+                else:
+                    # json.loads succeeded; if it's a list that's fine
+                    pass
+            elif ptype in ("dict", "object"):
+                if isinstance(param_value, str):
+                    try:
+                        param_value = json.loads(param_value)
+                    except json.JSONDecodeError:
+                        import ast as _ast
+                        try:
+                            param_value = _ast.literal_eval(param_value)
+                        except Exception:
+                            pass  # leave as string
             else:
-                # string
+                # string or unknown — leave as-is
                 pass
 
         # Enum check

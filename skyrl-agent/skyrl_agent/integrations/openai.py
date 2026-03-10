@@ -18,7 +18,9 @@ class OpenAIBackendConfig(TypedDict):
 
 
 class OpenAIBackend(AsyncInferBackend):
-    def __init__(self, infer_engine: Any, cfg: OpenAIBackendConfig):
+    def __init__(self, infer_engine: Any, tokenizer: Any = None, cfg: OpenAIBackendConfig = None):
+        if cfg is None:
+            raise ValueError("OpenAIBackend requires cfg")
         assert os.environ.get("OPENAI_API_KEY") is not None, "OPENAI_API_KEY is not set"
         self.model_name = cfg["model_name"]
         self.api_url = cfg["api_url"]
@@ -49,9 +51,12 @@ class OpenAIBackend(AsyncInferBackend):
             output = await output.json()
 
             try:
-                return output["choices"][0]["message"]["content"]
+                content = output["choices"][0]["message"]["content"]
+                meta_info = {"finish_reason": output["choices"][0].get("finish_reason")}
+                return content, meta_info
             except Exception as e:
                 logger.info(f"Errored out while extracting first response from output {output} with exception {str(e)}")
+                return "", {"finish_reason": "error"}
 
     async def async_generate_ids(self, input_ids: List[int], sampling_params: dict, **kwargs) -> str:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
@@ -85,7 +90,9 @@ class OpenAIAPIBackendConfig(TypedDict):
 class OpenAIAPIBackend(AsyncInferBackend):
     use_chat_api = True
 
-    def __init__(self, infer_engine: Any, cfg: OpenAIAPIBackendConfig):
+    def __init__(self, infer_engine: Any, tokenizer: Any = None, cfg: OpenAIAPIBackendConfig = None):
+        if cfg is None:
+            raise ValueError("OpenAIAPIBackend requires cfg")
         self.model_name = cfg["model_name"]
         self.api_url = cfg.get("api_url", "https://api.openai.com")
         self.api_key = cfg.get("api_key", os.environ.get("OPENAI_API_KEY"))
@@ -100,6 +107,8 @@ class OpenAIAPIBackend(AsyncInferBackend):
             if not isinstance(sampling_params, dict):
                 sampling_params = dict(sampling_params)
             payload = sampling_params.copy()
+            if "max_tokens" in payload and "max_completion_tokens" not in payload:
+                payload["max_completion_tokens"] = payload.pop("max_tokens")
             payload["model"] = self.model_name
             if isinstance(prompts, list):
                 payload["messages"] = prompts
@@ -108,9 +117,12 @@ class OpenAIAPIBackend(AsyncInferBackend):
             output = await session.post(f"{self.api_url}/v1/chat/completions", json=payload, headers=headers)
             output = await output.json()
             try:
-                return output["choices"][0]["message"]["content"]
+                content = output["choices"][0]["message"]["content"]
+                meta_info = {"finish_reason": output["choices"][0].get("finish_reason")}
+                return content, meta_info
             except Exception as e:
                 logger.info(f"Errored out while extracting first response from output {output} with exception {str(e)}")
+                return "", {"finish_reason": "error"}
 
     async def async_generate_ids(self, input_ids: List[int], sampling_params: dict, **kwargs) -> str:
         raise RuntimeError("OpenAIAPIBackend requires chat messages; use async_generate_prompts.")

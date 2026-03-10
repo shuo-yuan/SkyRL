@@ -1,4 +1,5 @@
 from typing import Dict, Any
+import json
 import asyncio
 
 from skyrl_agent.tasks.base import BaseTask
@@ -11,11 +12,12 @@ class GeneralReactTask(BaseTask):
         pass
 
     @classmethod
-    def get_instruction(cls, instance: Dict[str, Any]) -> str:
+    def get_instruction(cls, instance: Dict[str, Any]) -> list:
         print(instance)
         # (TODO) Dacheng: A hack to make inference only compatible.
         # During inference, the key is "prompt"
         # During training, the key is "raw_prompt"
+        prompt = None
         if "raw_prompt" in instance:
             import numpy
 
@@ -28,10 +30,30 @@ class GeneralReactTask(BaseTask):
             prompt = list(instance.get("raw_prompt"))
         else:
             prompt = instance.get("prompt")
+        if prompt is None:
+            prompt = instance.get("question")
 
         print(f"Prompt: {prompt}")
 
-        # assume prompt is a list of messages
+        # normalize to list of messages
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], list):
+            prompt = prompt[0]
+        if isinstance(prompt, dict):
+            prompt = [prompt]
+        if isinstance(prompt, str):
+            stripped = prompt.strip()
+            if stripped.startswith("[") or stripped.startswith("{"):
+                try:
+                    loaded = json.loads(stripped)
+                    prompt = loaded
+                except Exception:
+                    prompt = [{"role": "user", "content": prompt}]
+            else:
+                prompt = [{"role": "user", "content": prompt}]
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], list):
+            prompt = prompt[0]
+        if isinstance(prompt, dict):
+            prompt = [prompt]
         assert isinstance(prompt, list), f"Prompt must be a list, but got {type(prompt)}"
 
         # Check if there's already a system message
@@ -88,7 +110,10 @@ class GeneralReactTask(BaseTask):
                     \n<function=finish>\n<parameter=answer>The final answer goes here.</parameter>\n</function>",
                 }
             else:
-                assert False, f"Data source {data_source} is not supported for ReAct agent."
+                system_prompt = {
+                    "role": "system",
+                    "content": "Please solve the problem with the following tools and return the final answer inside the finish tool.",
+                }
             prompt = [system_prompt] + prompt
 
         print(f"Prompt after system prompt: {prompt}")

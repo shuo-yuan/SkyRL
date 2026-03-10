@@ -7,7 +7,7 @@ TOOL_CALL_PARSE_ERROR_GUIDANCE = (
     "<function=tool_name>\n"
     "<parameter=param_name>value</parameter>\n"
     "</function>\n\n"
-    "Remember: Always end with the finish tool using \\boxed{} format."
+    "Remember: Always end with the finish tool using \\boxed{{}} format."
 )
 
 

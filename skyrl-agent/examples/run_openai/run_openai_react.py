@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 import datasets
 import asyncio
 
-os.environ["OPENAI_API_KEY"] = ""  # dummy key, assumes an unath'ed vLLM service running locally
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") # dummy key, assumes an unath'ed vLLM service running locally
 model = "Qwen/Qwen3-32B"
 
 tokenizer = AutoTokenizer.from_pretrained(model)
