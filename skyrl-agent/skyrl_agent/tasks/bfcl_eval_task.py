@@ -210,7 +210,9 @@ class BFCLEvalTask(BaseTask):
             "You should only return the function calls in your response. "
             "At each turn, you should try your best to complete the tasks requested by the user within the current turn. "
             "Continue to output functions to call until you have fulfilled the user's request to the best of your ability. "
-            "Once you have no more functions to call, the system will consider the current turn complete and proceed to the next turn or task."
+            "Once you have no more functions to call, the system will consider the current turn complete and proceed to the next turn or task. "
+            "If the task requires multiple parallel function calls, you may output all of them in a single response, "
+            "one after another in the specified format."
         )
         # If there's already a system message, prepend to its content.
         if msgs and msgs[0].get("role") == "system":

@@ -1,6 +1,7 @@
 import json
+import re
 import copy
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple, Optional
 from collections import defaultdict
 from uuid import uuid4
 import traceback
@@ -34,7 +35,11 @@ from .messages import (
     TOOL_INVOCATION_ERROR_GUIDANCE,
     get_turn_reminder_text,
 )
-from skyrl_agent.functional.function_calling import convert_fncall_messages_to_non_fncall_messages
+from skyrl_agent.functional.function_calling import (
+    convert_fncall_messages_to_non_fncall_messages,
+    _extract_and_validate_params,
+    FunctionCallValidationError,
+)
 
 
 class ReActAgent:
@@ -385,6 +390,58 @@ class ReActAgent:
         _PARALLEL_CATEGORIES = {"parallel", "parallel_multiple", "live_parallel", "live_parallel_multiple"}
         return cat in _PARALLEL_CATEGORIES
 
+    # Regex patterns for BFCL function call parsing (reuse same format as function_calling.py)
+    _BFCL_FN_REGEX = re.compile(r"<function=([^>]+)>\n(.*?)</function>", re.DOTALL)
+    _BFCL_PARAM_REGEX = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+
+    def _extract_bfcl_calls_from_response(
+        self, response_str: str
+    ) -> List[Tuple[str, Dict]]:
+        """
+        Extract ALL <function=...> calls from a BFCL response string.
+
+        Used for parallel BFCL tasks where the model may output multiple function
+        calls in a single response. Returns a list of (fn_name, fn_args) tuples
+        for every valid <function=...> block found in the response.
+
+        Safe for non-BFCL contexts: called only when has_bfcl_tools=True and
+        has_registered_tools=False.
+        """
+        active_tools = self._get_active_tool_params()
+        calls: List[Tuple[str, Dict]] = []
+
+        for fn_match in self._BFCL_FN_REGEX.finditer(response_str):
+            fn_name = fn_match.group(1)
+            fn_body = fn_match.group(2)
+
+            # Skip system tools
+            if fn_name in {"finish", "load", "evict"}:
+                continue
+
+            # Look up schema
+            matching_tool = next(
+                (
+                    t["function"]
+                    for t in active_tools
+                    if t.get("type") == "function" and t["function"]["name"] == fn_name
+                ),
+                None,
+            )
+            if not matching_tool:
+                continue
+
+            # Parse parameters
+            param_matches = self._BFCL_PARAM_REGEX.finditer(fn_body)
+            try:
+                args = _extract_and_validate_params(matching_tool, param_matches, fn_name)
+            except (FunctionCallValidationError, Exception):
+                # Malformed call — skip rather than fail the whole step
+                continue
+
+            calls.append((fn_name, args))
+
+        return calls
+
     async def _execute_bfcl_tool(self, tool_name: str, tool_args: Any, tool_call_id: str) -> Any:
         """Execute a BFCL single-turn function call.
 
@@ -524,6 +581,25 @@ class ReActAgent:
                         "arguments": recorded_args,
                     })
 
+                    # Also capture any additional <function=...> calls in the same
+                    # response (batch parallel mode: model outputs all calls at once).
+                    # _extract_bfcl_calls_from_response returns ALL calls in order;
+                    # index 0 is the call we already recorded above, so we skip it.
+                    # Only applies to BFCL context; safe no-op for non-BFCL tasks.
+                    _extra_parallel_calls: List[Tuple[str, Dict]] = []
+                    if has_bfcl_tools and not has_registered_tools:
+                        all_calls = self._extract_bfcl_calls_from_response(response_str)
+                        _extra_parallel_calls = all_calls[1:]
+                        for extra_fn_name, extra_fn_args in _extra_parallel_calls:
+                            self._bfcl_recorded_calls.append({
+                                "function": extra_fn_name,
+                                "arguments": extra_fn_args,
+                            })
+                            print(
+                                f"[Agent Step {self.step_count}] BFCL: captured additional "
+                                f"parallel call {extra_fn_name} from same response."
+                            )
+
                 if tool_name in {"load", "evict", "finish"} and tool_name not in self.tools:
                     pass
                 # 6. Check if finish tool was called
@@ -531,13 +607,21 @@ class ReActAgent:
                     print(f"[Agent Step {self.step_count}] Finish tool called. Stopping agent.")
                     result = StepResult.finished("FINISH_TOOL", output)
                 else:
-                    # For non-parallel BFCL categories (simple, multiple, …):
-                    # stop immediately after the first function call.
-                    # For parallel categories (parallel, parallel_multiple, …):
-                    # continue until the model stops on its own.
+                    # For non-parallel BFCL (simple, multiple, …): stop after first call.
+                    # For parallel BFCL:
+                    #   - Batch mode (model output N calls at once): all already recorded,
+                    #     stop immediately to avoid the model re-outputting the same calls.
+                    #   - Sequential mode (model output 1 call): continue until model stops.
                     if has_bfcl_tools and not has_registered_tools and not self._is_parallel_bfcl():
                         print(f"[Agent Step {self.step_count}] BFCL single-step: stopping after first call.")
                         result = StepResult.finished("BFCL_SINGLE_TURN_DONE", self._bfcl_recorded_calls)
+                    elif has_bfcl_tools and not has_registered_tools and _extra_parallel_calls:
+                        # Batch parallel: all calls captured in one shot — stop now.
+                        print(
+                            f"[Agent Step {self.step_count}] BFCL batch parallel: "
+                            f"captured {1 + len(_extra_parallel_calls)} calls, stopping."
+                        )
+                        result = StepResult.finished("BFCL_PARALLEL_BATCH_DONE", self._bfcl_recorded_calls)
                     else:
                         result = StepResult.continuing(response_str)
 
@@ -594,7 +678,9 @@ class ReActAgent:
             finish_reason = "max_iterations_reached"
 
         # Normalise BFCL finish reasons
-        if is_bfcl_single_turn and finish_reason in ("BFCL_TURN_DONE", "BFCL_SINGLE_TURN_DONE"):
+        if is_bfcl_single_turn and finish_reason in (
+            "BFCL_TURN_DONE", "BFCL_SINGLE_TURN_DONE", "BFCL_PARALLEL_BATCH_DONE"
+        ):
             finish_reason = "BFCL_SINGLE_TURN_DONE"
             result = self._bfcl_recorded_calls
 

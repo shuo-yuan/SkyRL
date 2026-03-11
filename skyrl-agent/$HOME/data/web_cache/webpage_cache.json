@@ -1,0 +1,10 @@
+{
+  "cache_ordered": [],
+  "stats": {
+    "hits": 0,
+    "misses": 0,
+    "evictions": 0
+  },
+  "max_size": 10000,
+  "saved_at": 1773175773.6280775
+}
