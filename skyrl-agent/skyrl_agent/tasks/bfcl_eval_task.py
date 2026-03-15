@@ -192,27 +192,49 @@ class BFCLEvalTask(BaseTask):
     async def initialize_runtime(cls, *args, **kwargs) -> Any:
         return {}
 
+    # System prompt used when ALL functions are visible upfront (default mode)
+    _SYSTEM_PROMPT_UPFRONT = (
+        "You are an expert in composing functions. "
+        "You are given a question and a set of possible functions. "
+        "Based on the question, you will need to make one or more function/tool calls to achieve the purpose. "
+        "If none of the functions can be used, point it out. "
+        "If the given question lacks the parameters required by the function, also point it out. "
+        "You should only return the function calls in your response. "
+        "At each turn, you should try your best to complete the tasks requested by the user within the current turn. "
+        "Continue to output functions to call until you have fulfilled the user's request to the best of your ability. "
+        "Once you have no more functions to call, the system will consider the current turn complete and proceed to the next turn or task. "
+        "If the task requires multiple parallel function calls, you may output all of them in a single response, "
+        "one after another in the specified format."
+    )
+
+    # System prompt for tool-search mode.
+    # Step 1: call bfcl_tool_search to discover the right function.
+    # Step 2: call the function returned by the search.
+    _SYSTEM_PROMPT_TOOL_SEARCH = (
+        "You are an expert in composing functions. "
+        "You are given a question and a search tool to find relevant functions. "
+        "Based on the question, call bfcl_tool_search first to find the right function, "
+        "then call that function with the correct parameters. "
+        "If the search returns no relevant function, or if no function can fulfill the request, "
+        "say so clearly and do NOT call any function. "
+        "You should only return function calls in your response. "
+        "Once you have made all required function calls, stop."
+    )
+
     @classmethod
-    def get_instruction(cls, instance: Any) -> List[Dict[str, str]]:
+    def get_instruction(
+        cls,
+        instance: Any,
+        tool_search_mode: bool = False,
+    ) -> List[Dict[str, str]]:
         inst = _to_dict(instance)
         question = inst.get("question") or inst.get("prompt") or inst.get("raw_prompt") or ""
         msgs = _normalise_question_to_messages(question)
 
-        # Prepend a system message following the official BFCL prompt style,
-        # but using our <function=...> tool call format (injected later by
-        # convert_fncall_messages_to_non_fncall_messages).
         system_prompt = (
-            "You are an expert in composing functions. "
-            "You are given a question and a set of possible functions. "
-            "Based on the question, you will need to make one or more function/tool calls to achieve the purpose. "
-            "If none of the functions can be used, point it out. "
-            "If the given question lacks the parameters required by the function, also point it out. "
-            "You should only return the function calls in your response. "
-            "At each turn, you should try your best to complete the tasks requested by the user within the current turn. "
-            "Continue to output functions to call until you have fulfilled the user's request to the best of your ability. "
-            "Once you have no more functions to call, the system will consider the current turn complete and proceed to the next turn or task. "
-            "If the task requires multiple parallel function calls, you may output all of them in a single response, "
-            "one after another in the specified format."
+            cls._SYSTEM_PROMPT_TOOL_SEARCH
+            if tool_search_mode
+            else cls._SYSTEM_PROMPT_UPFRONT
         )
         # If there's already a system message, prepend to its content.
         if msgs and msgs[0].get("role") == "system":

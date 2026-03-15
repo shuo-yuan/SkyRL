@@ -30,6 +30,7 @@ generator:
   qwen3_acc_thinking: false
   early_step_threshold: 0
   enable_turn_reminder: false
+  fold_tool_info: false  # set true in batch mode to collapse each task's history into a summary
 
 dispatcher:
   type: async_batch

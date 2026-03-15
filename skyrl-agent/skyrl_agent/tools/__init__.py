@@ -10,3 +10,4 @@ from .next_memagent import NextWithSummary
 from .search import FaissSearch
 from .load import LoadTool
 from .evict import EvictTool
+from .bfcl_tool_search import BFCLToolSearchTool

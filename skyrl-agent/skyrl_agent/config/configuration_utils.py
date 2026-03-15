@@ -31,6 +31,11 @@ class TrajectoryConfig:
     early_step_threshold: int = 0  # Step count threshold for early reminder
     enable_turn_reminder: bool = False
     bfcl_tool_params_path: Optional[str] = None
+    # When True and running in batch mode, the conversation history for each
+    # completed task (tool searches, domain calls, responses) is folded into a
+    # single summary line before the next task begins.  This keeps context short
+    # and reduces model confusion in long batch conversations.
+    fold_tool_info: bool = False
 
 
 # DEPR

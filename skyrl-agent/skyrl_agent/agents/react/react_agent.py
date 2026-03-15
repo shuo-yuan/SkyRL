@@ -85,6 +85,35 @@ class ReActAgent:
         )
         self._active_bfcl_tool_params = self.bfcl_tool_params
 
+        # fold_tool_info: collapse completed-task history into a one-line summary
+        self._fold_tool_info: bool = getattr(traj_config, "fold_tool_info", False)
+        # Index of the current task's question message in history.
+        # Used by the folding logic to know which messages to keep.
+        self._bfcl_task_question_msg_idx: int = 1   # default: user msg after system
+        # Set by _try_advance_bfcl_batch when folding occurs; tells step() to
+        # skip _append_tool_output for the just-completed domain call.
+        self._fold_skip_append: bool = False
+
+        # Batch BFCL mode state (used by run_batch())
+        self._bfcl_batch_mode: bool = False
+        self._bfcl_batch_pending: List[Tuple[Dict, List[Dict]]] = []  # (instance, instruction) pairs
+        self._bfcl_all_task_results: List[List[Dict]] = []  # completed per-task call lists
+        self._bfcl_task_idx: int = 0  # current task index (0-based)
+
+        # Tool-search mode state (used when use_tool_search=True in run_batch())
+        # When enabled, combined tools are held in _bfcl_tool_pool instead of
+        # being placed in _active_bfcl_tool_params upfront.  The model must call
+        # bfcl_tool_search to retrieve tools before using them.
+        self._bfcl_tool_search_enabled: bool = False
+        self._bfcl_tool_pool: List[Dict] = []       # all available tools for this batch
+        self._bfcl_tool_search_k: int = 3           # k used as fallback inside _llm_retrieve
+        self._bfcl_bm25_k: int = 4                  # k specifically for BM25 retrieval
+        # Tools retrieved in the CURRENT task only (reset on task transition).
+        # Used for parse-validation so the model cannot accidentally call a tool
+        # from a prior task.  _active_bfcl_tool_params keeps the full history
+        # (for future direct reuse without re-searching).
+        self._bfcl_current_task_tools: List[Dict] = []
+
         # In-context
         self.put_tools_in_context = True
 
@@ -163,7 +192,8 @@ class ReActAgent:
         # Determine if we should retokenize everything or use incremental encoding
         is_prompt = len(self.history) == 2  # system + user (with reminder appended)
         should_retokenize = is_prompt or history_was_reset or not self.transitions
-        active_tool_params = self._get_active_tool_params()
+        # Use display params (hides retrieved tools in tool-search mode).
+        active_tool_params = self._get_display_tool_params()
 
         if should_retokenize:
             # Retokenize everything (first message or after history reset)
@@ -359,7 +389,15 @@ class ReActAgent:
         return normalized if normalized else self.bfcl_tool_params
 
     def _get_active_tool_params(self) -> List[Dict[str, Any]]:
-        """Return tool schema exposed to model/parser for this run."""
+        """Return tool schema used for PARSING model responses.
+
+        Includes registered tools (e.g. bfcl_tool_search) plus:
+          - In tool-search mode: ONLY tools retrieved in the CURRENT task
+            (_bfcl_current_task_tools).  Using the full history
+            (_active_bfcl_tool_params) would allow the model to accidentally
+            call tools from prior tasks and pass parse validation silently.
+          - Otherwise: all retrieved BFCL tool params.
+        """
         merged: List[Dict[str, Any]] = list(self.tool_params)
         seen_names = set()
         for tp in merged:
@@ -368,7 +406,10 @@ class ReActAgent:
             if isinstance(name, str):
                 seen_names.add(name)
 
-        for tp in self._active_bfcl_tool_params:
+        # Use full accumulated tools for parse validation.
+        # (Restricting to current-task only would prevent correct tool reuse.)
+        source = self._active_bfcl_tool_params
+        for tp in source:
             if not isinstance(tp, dict):
                 continue
             fn = tp.get("function")
@@ -378,6 +419,22 @@ class ReActAgent:
             seen_names.add(name)
             merged.append(tp)
         return merged
+
+    def _get_display_tool_params(self) -> List[Dict[str, Any]]:
+        """Return tool schema used for building the system prompt (shown to model).
+
+        In tool-search mode the system prompt always shows ONLY bfcl_tool_search,
+        regardless of what has been retrieved so far.  Previously retrieved tools
+        are communicated via the search result guidance message (not the system
+        prompt), and are available in _get_active_tool_params() for parse
+        validation so the model can call them directly based on prior guidance.
+
+        Outside tool-search mode this is identical to _get_active_tool_params().
+        """
+        if self._bfcl_tool_search_enabled:
+            # System prompt: only the registered support tools (bfcl_tool_search).
+            return list(self.tool_params)
+        return self._get_active_tool_params()
 
     def _is_parallel_bfcl(self) -> bool:
         """Return True if this is a parallel BFCL category (needs multiple calls per turn)."""
@@ -442,6 +499,96 @@ class ReActAgent:
 
         return calls
 
+    def _try_advance_bfcl_batch(self) -> bool:
+        """Save current task's calls and advance to the next task in batch mode.
+
+        Returns True if successfully advanced (more tasks remain),
+        False if all tasks are done.
+        """
+        # Save current task result before clearing
+        self._bfcl_all_task_results.append(list(self._bfcl_recorded_calls))
+        self._bfcl_recorded_calls = []
+
+        if not self._bfcl_batch_pending:
+            return False  # all tasks done
+
+        self._bfcl_task_idx += 1
+        next_instance, next_instruction = self._bfcl_batch_pending.pop(0)
+
+        # If fold_tool_info is enabled, collapse the completed task's messages
+        # (search calls, search results, domain calls, tool responses, etc.)
+        # into a single summary line.  This keeps the context short.
+        # Also set _fold_skip_append so step() skips _append_tool_output for
+        # the domain call that just completed (its result is in the summary).
+        if self._fold_tool_info:
+            completed_calls = self._bfcl_all_task_results[-1]  # just saved
+            fn_names = [c.get("function", "?") for c in completed_calls]
+            if fn_names:
+                summary = (
+                    f"[Task {self._bfcl_task_idx} complete. "
+                    f"Called: {', '.join(fn_names)}.]"
+                )
+            else:
+                summary = f"[Task {self._bfcl_task_idx} complete. No function called.]"
+            # Keep everything up to and including the task's question message,
+            # then append the summary.  Everything in between (tool calls, search
+            # results, intermediate assistant messages) is discarded.
+            self.history.messages = (
+                self.history.messages[: self._bfcl_task_question_msg_idx + 1]
+                + [{"role": "user", "content": summary}]
+            )
+            self._fold_skip_append = True   # signal step() to skip _append_tool_output
+
+        # Update instance so _is_parallel_bfcl() uses the correct category
+        self.instance = next_instance
+        # Normal mode: keep combined _active_bfcl_tool_params (all upfront).
+
+        # Extract user-role content from the next task's instruction
+        next_user_msgs = [m for m in next_instruction if m.get("role") == "user"]
+        next_question = next_user_msgs[0]["content"] if next_user_msgs else ""
+
+        # Inject transition message into history
+        self.history.add_user_guidance(
+            f"Task {self._bfcl_task_idx} done.\n\n"
+            f"Task {self._bfcl_task_idx + 1}:\n{next_question}"
+        )
+        # Track where the new task's question is so folding knows what to keep.
+        self._bfcl_task_question_msg_idx = len(self.history.messages) - 1
+        print(
+            f"[Batch] Saved task {self._bfcl_task_idx} result "
+            f"({len(self._bfcl_all_task_results[-1])} calls), "
+            f"advancing to task {self._bfcl_task_idx + 1}."
+        )
+        return True
+
+    def _add_bfcl_tools_to_active(self, new_tools: List[Dict]) -> None:
+        """Add tools to _active_bfcl_tool_params (deduplicated by function name).
+
+        Called by BFCLToolSearchTool after retrieval.
+        Also adds tools to _bfcl_current_task_tools (current-task scope,
+        reset on task transition) so parse-validation stays scoped to the
+        current task and does not accidentally accept calls to prior-task tools.
+        """
+        existing_names = {
+            t.get("function", {}).get("name", "")
+            for t in self._active_bfcl_tool_params
+            if isinstance(t, dict)
+        }
+        current_names = {
+            t.get("function", {}).get("name", "")
+            for t in self._bfcl_current_task_tools
+            if isinstance(t, dict)
+        }
+        for tool in new_tools:
+            name = tool.get("function", {}).get("name", "") if isinstance(tool, dict) else ""
+            if name:
+                if name not in existing_names:
+                    self._active_bfcl_tool_params.append(tool)
+                    existing_names.add(name)
+                if name not in current_names:
+                    self._bfcl_current_task_tools.append(tool)
+                    current_names.add(name)
+
     async def _execute_bfcl_tool(self, tool_name: str, tool_args: Any, tool_call_id: str) -> Any:
         """Execute a BFCL single-turn function call.
 
@@ -492,8 +639,11 @@ class ReActAgent:
             # 1. Prepare LLM input
             if getattr(self.infer_engine, "use_chat_api", False):
                 sampling_params = copy.deepcopy(self.sampling_params)
+                # Use display params: in tool-search mode this hides retrieved
+                # domain tools from the system prompt (they appear only in the
+                # search result guidance message).
                 messages = convert_fncall_messages_to_non_fncall_messages(
-                    self.history.messages, self._get_active_tool_params()
+                    self.history.messages, self._get_display_tool_params()
                 )
                 input_ids = []
             else:
@@ -527,9 +677,12 @@ class ReActAgent:
             parse_tool_params = self._get_active_tool_params()
             tool_call, parse_error = parse_tool_call(response_str, parse_tool_params)
 
-            # Determine if this is a BFCL-only run (no registered tools like finish)
-            has_bfcl_tools = bool(self._active_bfcl_tool_params)
-            has_registered_tools = bool(self.tools)
+            # Determine if this is a BFCL-only run (no registered tools like finish).
+            # bfcl_tool_search is a support tool, not a "real" registered tool for
+            # the purpose of BFCL detection — exclude it from has_registered_tools.
+            _BFCL_SUPPORT_TOOLS = frozenset({"bfcl_tool_search"})
+            has_bfcl_tools = bool(self._active_bfcl_tool_params) or self._bfcl_tool_search_enabled
+            has_registered_tools = bool(set(self.tools) - _BFCL_SUPPORT_TOOLS)
 
             # Handle parse error
             if parse_error:
@@ -537,7 +690,10 @@ class ReActAgent:
                 # output just mean the model is done (BFCL style: no function call = turn over).
                 if has_bfcl_tools and not has_registered_tools:
                     print(f"[Agent Step {self.step_count}] BFCL: model output is not a function call, stopping.")
-                    result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
+                    if self._bfcl_batch_mode and self._try_advance_bfcl_batch():
+                        result = StepResult.continuing(response_str)
+                    else:
+                        result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
                 else:
                     self._handle_parse_error(parse_error)
 
@@ -546,7 +702,10 @@ class ReActAgent:
                 if has_bfcl_tools and not has_registered_tools:
                     # BFCL style: no function call output = turn/task is done
                     print(f"[Agent Step {self.step_count}] BFCL: no function call detected, stopping.")
-                    result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
+                    if self._bfcl_batch_mode and self._try_advance_bfcl_batch():
+                        result = StepResult.continuing(response_str)
+                    else:
+                        result = StepResult.finished("BFCL_TURN_DONE", self._bfcl_recorded_calls)
                 elif not has_registered_tools and not has_bfcl_tools:
                     print(f"[Agent Step {self.step_count}] No tools provided, returning response.")
                     result = StepResult.finished("FINISH", response_str)
@@ -557,9 +716,10 @@ class ReActAgent:
                 # 4. Extract tool information
                 tool_name, tool_args = extract_tool_info(tool_call)
                 tool_call_id = tool_call.get("id")
-
                 # 5. Execute tool
-                if tool_name in {"load", "evict", "finish"}:
+                # bfcl_tool_search is treated as a support / registered tool:
+                # it updates _active_bfcl_tool_params and then we continue.
+                if tool_name in {"load", "evict", "finish", "bfcl_tool_search"}:
                     if tool_name not in self.tools:
                         self.history.add_user_guidance(json.dumps({"error": f"Tool '{tool_name}' not found."}))
                         result = StepResult.continuing(response_str)
@@ -606,6 +766,33 @@ class ReActAgent:
                 elif tool_name == "finish":
                     print(f"[Agent Step {self.step_count}] Finish tool called. Stopping agent.")
                     result = StepResult.finished("FINISH_TOOL", output)
+                elif tool_name == "bfcl_tool_search":
+                    # Search / retrieval tool: always continue so the model can
+                    # call the domain function it just retrieved.  Never triggers
+                    # BFCL stop logic.
+                    # We use add_user_guidance (not _append_tool_output) to avoid
+                    # double-JSON-encoding the output string.
+                    print(f"[Agent Step {self.step_count}] bfcl_tool_search executed, continuing.")
+                    if output is not None:
+                        print(f"[Tool Output step {self.step_count}] (bfcl_tool_search) {output[:200]}…")
+                        # Parse the output and produce a readable plain-text message
+                        try:
+                            parsed = json.loads(output)
+                            found = parsed.get("found", 0)
+                            desc  = parsed.get("tool_descriptions", "")
+                            if found > 0 and desc:
+                                guidance = (
+                                    f"Search complete. Found {found} function(s):\n\n"
+                                    f"{desc}\n"
+                                    "Now call the appropriate function above using the standard format."
+                                )
+                            else:
+                                guidance = parsed.get("message", str(output))
+                        except Exception:
+                            guidance = str(output)
+                        print(f"[Guidance to model step {self.step_count}] {guidance[:300]}…")
+                        self.history.add_user_guidance(guidance)
+                    result = StepResult.continuing(response_str)
                 else:
                     # For non-parallel BFCL (simple, multiple, …): stop after first call.
                     # For parallel BFCL:
@@ -613,20 +800,30 @@ class ReActAgent:
                     #     stop immediately to avoid the model re-outputting the same calls.
                     #   - Sequential mode (model output 1 call): continue until model stops.
                     if has_bfcl_tools and not has_registered_tools and not self._is_parallel_bfcl():
-                        print(f"[Agent Step {self.step_count}] BFCL single-step: stopping after first call.")
-                        result = StepResult.finished("BFCL_SINGLE_TURN_DONE", self._bfcl_recorded_calls)
+                        # Non-parallel: stop after first call (or advance to next batch task)
+                        if self._bfcl_batch_mode and self._try_advance_bfcl_batch():
+                            print(f"[Agent Step {self.step_count}] BFCL batch: task done, advancing.")
+                            result = StepResult.continuing(response_str)
+                        else:
+                            print(f"[Agent Step {self.step_count}] BFCL single-step: stopping after first call.")
+                            result = StepResult.finished("BFCL_SINGLE_TURN_DONE", self._bfcl_recorded_calls)
                     elif has_bfcl_tools and not has_registered_tools and _extra_parallel_calls:
-                        # Batch parallel: all calls captured in one shot — stop now.
-                        print(
-                            f"[Agent Step {self.step_count}] BFCL batch parallel: "
-                            f"captured {1 + len(_extra_parallel_calls)} calls, stopping."
-                        )
-                        result = StepResult.finished("BFCL_PARALLEL_BATCH_DONE", self._bfcl_recorded_calls)
+                        # Batch parallel: all calls captured in one shot — stop (or advance).
+                        if self._bfcl_batch_mode and self._try_advance_bfcl_batch():
+                            print(f"[Agent Step {self.step_count}] BFCL batch parallel: task done, advancing.")
+                            result = StepResult.continuing(response_str)
+                        else:
+                            print(
+                                f"[Agent Step {self.step_count}] BFCL batch parallel: "
+                                f"captured {1 + len(_extra_parallel_calls)} calls, stopping."
+                            )
+                            result = StepResult.finished("BFCL_PARALLEL_BATCH_DONE", self._bfcl_recorded_calls)
                     else:
                         result = StepResult.continuing(response_str)
 
                     # 7. Append tool output to history only if output is not None
-                    if output is not None:
+                    # and fold did not already clean up this task's history.
+                    if output is not None and not self._fold_skip_append:
                         print(f"[Tool Output step {self.step_count}] {output}")
                         self._append_tool_output(output, tool_call_id)
                         if tool_name == "load":
@@ -634,7 +831,9 @@ class ReActAgent:
                         elif tool_name == "evict":
                             self._evict_tools_from_buffer(output)
                     else:
-                        print(f"[Tool Output step {self.step_count}] No output (feedback embedded in user message)")
+                        if not self._fold_skip_append:
+                            print(f"[Tool Output step {self.step_count}] No output (feedback embedded in user message)")
+                    self._fold_skip_append = False   # reset after each step
 
         except StepException as e:
             # Handle expected control flow exceptions
@@ -657,8 +856,9 @@ class ReActAgent:
         self.instance = instance
         self._active_bfcl_tool_params = self._resolve_bfcl_tool_params_from_instance(instance)
 
-        has_bfcl_tools = bool(self._active_bfcl_tool_params)
-        has_registered_tools = bool(self.tools)
+        _BFCL_SUPPORT_TOOLS = frozenset({"bfcl_tool_search"})
+        has_bfcl_tools = bool(self._active_bfcl_tool_params) or self._bfcl_tool_search_enabled
+        has_registered_tools = bool(set(self.tools) - _BFCL_SUPPORT_TOOLS)
         is_bfcl_single_turn = has_bfcl_tools and not has_registered_tools
 
         self._init_message(instruction)
@@ -687,8 +887,110 @@ class ReActAgent:
         print("[Agent Run] Final messages:", self.get_messages())
         return finish_reason, result
 
+    async def run_batch(
+        self,
+        instructions: List[List[Dict]],
+        instances: List[Dict],
+        combined_tool_params: Optional[List[Dict]] = None,
+        use_tool_search: bool = False,
+        tool_search_k: int = 3,
+        bm25_k: int = 4,
+        tool_search_retrieval: str = "bm25",
+        tool_search_llm_model: str = "gpt-5-nano",
+        tool_search_llm_base_url: str = "https://api.openai.com/v1",
+    ) -> Tuple[str, List[List[Dict]]]:
+        """Run N BFCL tasks sequentially in one conversation.
+
+        Args:
+            instructions:             Per-task instruction message lists.
+            instances:                Per-task dataset row dicts.
+            combined_tool_params:     Pre-combined tool params; None = first instance only.
+            use_tool_search:          False (default) = all tools upfront (original behaviour).
+                                      True = only bfcl_tool_search in system prompt; model
+                                      must call it to retrieve tools.
+            tool_search_k:            Tools returned per search query (default 3).
+            tool_search_retrieval:    "bm25" (default) or "llm".
+            tool_search_llm_model:    LLM model for retrieval (default "gpt-5-nano").
+            tool_search_llm_base_url: Base URL for LLM retrieval API.
+
+        Returns:
+            ("BFCL_BATCH_DONE", [task0_calls, task1_calls, ..., taskN_calls])
+        """
+        if not instances:
+            return "BFCL_BATCH_DONE", []
+
+        # Initialise batch state
+        self._bfcl_batch_mode = True
+        self._bfcl_batch_pending = list(zip(instances[1:], instructions[1:]))
+        self._bfcl_all_task_results = []
+        self._bfcl_task_idx = 0
+        self.instance = instances[0]
+
+        # ── Tool-search mode vs. upfront-tools mode ──────────────
+        all_tools = combined_tool_params or self._resolve_bfcl_tool_params_from_instance(instances[0])
+
+        if use_tool_search:
+            # Store all tools in the retrieval pool; start with empty active params.
+            # The model must call bfcl_tool_search before using any tool.
+            self._bfcl_tool_search_enabled = True
+            self._bfcl_tool_pool = list(all_tools)
+            self._bfcl_tool_search_k = tool_search_k
+            self._bfcl_bm25_k = bm25_k
+            # Retrieval settings read by BFCLToolSearchTool.call()
+            self._bfcl_tool_search_retrieval = tool_search_retrieval
+            self._bfcl_tool_search_llm_model = tool_search_llm_model
+            self._bfcl_tool_search_llm_base_url = tool_search_llm_base_url
+            self._active_bfcl_tool_params = []
+            self._bfcl_current_task_tools = []   # reset for new batch
+        else:
+            # Original behaviour: all tools visible upfront.
+            self._bfcl_tool_search_enabled = False
+            self._bfcl_tool_pool = []
+            self._active_bfcl_tool_params = list(all_tools)
+
+        # Bootstrap with first task's instruction
+        self._init_message(instructions[0])
+        # After _init_message the history is [system, user].
+        # The user message (index 1) is the first task's question.
+        self._bfcl_task_question_msg_idx = 1
+
+        finish_reason = "max_iterations_reached"
+        while self.step_count < self.max_iterations:
+            try:
+                done, finish_reason, result = await self.step()
+                if done:
+                    break
+            except Exception as e:
+                print(f"[Batch Run Error] {e}")
+                print(traceback.format_exc())
+                finish_reason = f"error: {e}"
+                break
+
+        # If the last task ended via max_iterations (not via stop signal),
+        # save whatever calls were recorded.
+        if len(self._bfcl_all_task_results) < len(instances):
+            self._bfcl_all_task_results.append(list(self._bfcl_recorded_calls))
+
+        # Pad missing tasks with empty call lists
+        while len(self._bfcl_all_task_results) < len(instances):
+            self._bfcl_all_task_results.append([])
+
+        self._bfcl_batch_mode = False
+        self._bfcl_tool_search_enabled = False
+        self._bfcl_tool_pool = []
+        self._bfcl_current_task_tools = []
+        final_results = self._bfcl_all_task_results[: len(instances)]
+        print(f"[Agent Batch] Done. {len(instances)} tasks, finish_reason={finish_reason}")
+        print(f"[Agent Batch] Per-task call counts: "
+              f"{[len(r) for r in final_results]}")
+        for i, (task_calls, inst) in enumerate(zip(final_results, instances)):
+            entry_id = str(inst.get('id', f'task{i}')) if isinstance(inst, dict) else f'task{i}'
+            fn_names = [c.get('function','?') for c in task_calls]
+            print(f"[Agent Batch]   task {i} ({entry_id}): {fn_names}")
+        return "BFCL_BATCH_DONE", final_results
+
     def get_messages(self) -> List[dict]:
-        return convert_fncall_messages_to_non_fncall_messages(self.history.messages, self._get_active_tool_params())
+        return convert_fncall_messages_to_non_fncall_messages(self.history.messages, self._get_display_tool_params())
 
     def get_transitions(self) -> List[Transition]:
         """Return the list of transitions recorded during agent execution.
