@@ -14,8 +14,9 @@ Usage:
 # ─── configure ───────────────────────────────────────────────────
 POOL_SIZES    = [1, 64, 128, 256, 512]
 MAX_PARALLEL  = 200          # concurrent API calls shared across all runs
-BM25_K        = 4            # k for BM25 retrieval (number of tools returned)
-OUTPUT_DIR    = "outputs/bfcl_pool_sweep"
+SEARCH_K      = 4            # k for retrieval (number of tools returned)
+OUTPUT_DIR    = "outputs/bfcl_pool_sweep"  # Output directory
+LLM_MODEL     = "gpt-5-nano"  # LLM retriever model
 # ─────────────────────────────────────────────────────────────────
 
 import asyncio, datasets, json, os, time
@@ -89,10 +90,9 @@ async def run_one(sem, inst, pool, idx, use_search, retrieval="llm"):
                 instructions=[instr], instances=[inst],
                 combined_tool_params=combined,
                 use_tool_search=use_search,
-                tool_search_k=3,
-                bm25_k=BM25_K,
+                search_k=SEARCH_K,  # Use SEARCH_K (k=4) for LLM retriever
                 tool_search_retrieval=retrieval,
-                tool_search_llm_model="gpt-5-nano",
+                tool_search_llm_model=LLM_MODEL,
             )
         except Exception as e:
             return 0.0
@@ -144,8 +144,8 @@ async def run_condition(all_inst, pool_size, use_search, sem,
             for c, v in cat_rewards.items()
         },
     }
-    suffix = {"In-Context": "incontext", "TST-LLM": "tst_llm",
-              "TST-GT": "tst_gt"}.get(label, label.lower().replace(" ", "_"))
+    suffix = {"In-Context": "incontext", "TST-LLM": "tst_llm", "TST-LLM-mini": "tst_llm_mini",
+              "TST-LLM-k4": "tst_llm_k4", "TST-GT": "tst_gt"}.get(label, label.lower().replace(" ", "_").replace("-", "_"))
     fname = Path(OUTPUT_DIR) / f"pool{pool_size}_{suffix}_results.json"
     fname.write_text(json.dumps(result, indent=2))
     return pool_size, label, avg
@@ -168,10 +168,9 @@ async def main():
 
     # Launch all (pool_size × condition) combos concurrently
     # conditions: (use_search, retrieval_method, label_suffix)
+    # Run TST-LLM with k=4
     conditions = [
-        (False, "bm25",         "In-Context"),
-        (True,  "llm",          "TST-LLM"),
-        (True,  "ground_truth", "TST-GT"),
+        (True,  "llm",          "TST-LLM-k4"),  # Using gpt-5-nano as retriever with k=4
     ]
     coros = [
         run_condition(all_inst, ps, use_search, sem, retrieval, label)
@@ -185,67 +184,25 @@ async def main():
     print(f"\n{'='*55}")
     print(f"Summary  (total wall-clock: {total_elapsed:.0f}s)")
     print(f"{'='*55}")
-    print(f"{'Pool':>6}  {'In-Context':>12}  {'TST-LLM':>12}  {'TST-GT':>10}")
-    print("-" * 48)
+    print(f"{'Pool':>6}  {'TST-LLM-k4':>14}")
+    print("-" * 25)
     by_pool: Dict[int, Dict[str, float]] = defaultdict(dict)
     for ps, label, avg in results:
         by_pool[ps][label] = avg
     for ps in POOL_SIZES:
-        ic  = by_pool[ps].get("In-Context", float("nan"))
-        tst = by_pool[ps].get("TST-LLM",    float("nan"))
-        gt  = by_pool[ps].get("TST-GT",      float("nan"))
-        print(f"  {ps:>4}  {ic:>12.4f}  {tst:>12.4f}  {gt:>10.4f}")
+        tst = by_pool[ps].get("TST-LLM-k4", float("nan"))
+        print(f"  {ps:>4}  {tst:>14.4f}")
 
     # ── Save combined summary ──────────────────────────────────────
     summary = {
         str(ps): {
-            "In-Context": by_pool[ps].get("In-Context"),
-            "TST-LLM":    by_pool[ps].get("TST-LLM"),
+            "TST-LLM-k4": by_pool[ps].get("TST-LLM-k4"),
         }
         for ps in POOL_SIZES
     }
-    summary_file = Path(OUTPUT_DIR) / "pool_sweep_summary.json"
+    summary_file = Path(OUTPUT_DIR) / "pool_sweep_summary_llm_k4.json"
     summary_file.write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary → {summary_file}")
-
-    # ── Plot ──────────────────────────────────────────────────────
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(9, 5))
-        configs = [
-            ("In-Context", "#4CAF50", "o"),
-            ("TST-LLM",    "#2196F3", "s"),
-            ("TST-GT",     "#FF5722", "^"),
-        ]
-        for label, color, marker in configs:
-            xs = [ps for ps in POOL_SIZES if label in by_pool[ps]]
-            ys = [by_pool[ps][label] for ps in xs]
-            ax.plot(xs, ys, marker=marker, linewidth=2.5, markersize=9,
-                    color=color, label=label)
-            ax.fill_between(xs, ys, alpha=0.08, color=color)
-            for x, y in zip(xs, ys):
-                ax.annotate(f"{y:.3f}", xy=(x, y), xytext=(0, 10),
-                            textcoords="offset points", ha="center",
-                            fontsize=8.5, color=color, fontweight="bold")
-
-        ax.set_xscale("log")
-        ax.set_xticks(POOL_SIZES)
-        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
-        ax.set_xlabel("Tool pool size", fontsize=13)
-        ax.set_ylabel("Accuracy (avg reward)", fontsize=13)
-        ax.set_title("Task-1 Accuracy vs. Tool Pool Size", fontsize=14, fontweight="bold")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-        ax.legend(fontsize=11)
-        fig.tight_layout()
-        plot_file = Path(OUTPUT_DIR) / "pool_sweep_plot.png"
-        fig.savefig(plot_file, dpi=150)
-        plt.close(fig)
-        print(f"Plot saved → {plot_file}")
-    except Exception as e:
-        print(f"Plot skipped: {e}")
 
 
 if __name__ == "__main__":

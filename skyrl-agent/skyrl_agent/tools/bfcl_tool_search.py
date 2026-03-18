@@ -23,8 +23,9 @@ Configuration (via cfg dict or agent attributes):
   llm_model         any OpenAI model name  (default "gpt-5-nano")
   llm_base_url      OpenAI API base URL    (default https://api.openai.com/v1)
 
-K (how many tools are returned) is set by agent._bfcl_tool_search_k,
-which in turn comes from TOOL_SEARCH_K in the runner script.
+search_k (how many tools are returned) is set by agent._bfcl_search_k:
+  - For LLM retrieval: 0 = LLM decides how many, >0 = return exactly k tools
+  - For BM25 retrieval: must be >0
 
 Registration: "bfcl_tool_search"
 """
@@ -120,28 +121,31 @@ class BFCLToolSearchTool(BaseTool):
                 ),
             })
 
-        # General k (used as BM25 fallback inside _llm_retrieve if LLM fails)
-        k = int(getattr(agent, "_bfcl_tool_search_k", 3))
-        # BM25-specific k — controls how many tools BM25 retrieves directly.
-        # Default is 4; can be overridden via agent._bfcl_bm25_k or run_batch(bm25_k=...).
-        bm25_k = int(getattr(agent, "_bfcl_bm25_k", 4))
+        # search_k: For LLM retrieval, 0 = LLM decides, >0 = return k tools.
+        # For BM25, must be >0. Also used as fallback when LLM retrieval fails.
+        search_k = int(getattr(agent, "_bfcl_search_k", 0))
+        
+        # Validate: BM25 requires search_k > 0
+        method = getattr(agent, "_bfcl_tool_search_retrieval", self.retrieval_method)
+        if method == "bm25" and search_k <= 0:
+            search_k = 4  # Default fallback for BM25
+            print(f"[BFCLToolSearch] Warning: search_k={search_k} invalid for BM25, using {search_k}")
 
         # ── Dispatch to retrieval method ──────────────────────────
         # Agent-level attributes override the tool's own cfg so the
         # runner can inject settings without touching TOOL_REGISTRY.
-        method   = getattr(agent, "_bfcl_tool_search_retrieval", self.retrieval_method)
         llm_mdl  = getattr(agent, "_bfcl_tool_search_llm_model", self.llm_model)
         llm_url  = getattr(agent, "_bfcl_tool_search_llm_base_url", self.llm_base_url)
 
         if method == "ground_truth":
             retrieved = _ground_truth_retrieve(pool, agent)
         elif method == "llm":
-            retrieved = _llm_retrieve(pool, query, k, model=llm_mdl, base_url=llm_url)
+            retrieved = _llm_retrieve(pool, query, search_k, model=llm_mdl, base_url=llm_url)
         elif method == "bm25":
-            retrieved = _bm25_retrieve(pool, query, bm25_k)
+            retrieved = _bm25_retrieve(pool, query, search_k)
         else:
             # Fallback: treat unknown methods as bm25
-            retrieved = _bm25_retrieve(pool, query, bm25_k)
+            retrieved = _bm25_retrieve(pool, query, search_k if search_k > 0 else 4)
 
         if not retrieved:
             return json.dumps({"found": 0, "message": "No matching tools found."})
@@ -208,15 +212,16 @@ def _ground_truth_retrieve(pool: List[Dict], agent: Any) -> List[Dict]:
 def _llm_retrieve(
     pool: List[Dict],
     query: str,
-    k: int,
+    search_k: int,
     model: str = "gpt-5-nano",
     base_url: str = "https://api.openai.com/v1",
 ) -> List[Dict]:
-    """Use an LLM to pick all relevant tools from the pool for the given query.
+    """Use an LLM to pick relevant tools from the pool for the given query.
 
-    The LLM decides how many functions to return — it returns ALL functions
-    that are relevant to the query, not a fixed number k.  k is kept as a
-    parameter for the BM25 fallback only.
+    Args:
+        search_k: If 0, LLM decides how many functions to return (returns ALL
+                  relevant functions). If >0, LLM is asked to return exactly
+                  k functions. search_k is also used when falling back to BM25.
     Falls back to BM25 on any error.
     """
     if not pool:
@@ -233,14 +238,39 @@ def _llm_retrieve(
         name_to_tool[name] = tool
 
     catalogue = "\n".join(catalogue_lines)
-    prompt = (
-        f"Query: {query}\n\n"
-        f"Available functions:\n{catalogue}\n\n"
-        f"List ALL function names that are relevant to this query. "
-        f"If none are relevant, output 'NONE'. "
-        f"Output only the function names, one per line, no extra text."
-    )
+    
+    # Build prompt based on search_k
+    if search_k == 0:
+        # LLM decides how many to return
+        prompt = (
+            f"Query: {query}\n\n"
+            f"Available functions:\n{catalogue}\n\n"
+            f"List ALL function names that are relevant to this query. "
+            f"If none are relevant, output 'NONE'. "
+            f"Output only the function names, one per line, no extra text."
+        )
+    else:
+        # LLM must return exactly k functions
+        prompt = (
+            f"Query: {query}\n\n"
+            f"Available functions:\n{catalogue}\n\n"
+            f"You must return exactly {search_k} function name(s) that are most relevant to this query. "
+            f"Select the top {search_k} most relevant functions. "
+            f"If fewer than {search_k} functions are relevant, list only those. "
+            f"If none are relevant, output 'NONE'. "
+            f"Output exactly {search_k} function names (or fewer if not enough are relevant), one per line, no extra text."
+        )
 
+    # Print prompt for debugging
+    print(f"\n{'='*70}")
+    print(f"[LLM Retriever] Query: {query}")
+    print(f"[LLM Retriever] search_k: {search_k}")
+    print(f"[LLM Retriever] Pool size: {len(pool)}")
+    print(f"{'='*70}")
+    print(f"[LLM Retriever] PROMPT:")
+    print(prompt)
+    print(f"{'='*70}")
+    
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -253,8 +283,14 @@ def _llm_retrieve(
                 max_completion_tokens=32768,
             )
             raw = resp.choices[0].message.content or ""
+            
+            # Print response for debugging
+            print(f"[LLM Retriever] RESPONSE (attempt {attempt + 1}):")
+            print(raw)
+            print(f"{'='*70}\n")
             # LLM may output "NONE" when nothing is relevant
             if raw.strip().upper() == "NONE":
+                print(f"[LLM Retriever] LLM returned 'NONE', returning empty list")
                 return []
             # Parse function names from the response (one per line).
             # Handle "1. function_name" or bare "function_name" formats.
@@ -263,8 +299,24 @@ def _llm_retrieve(
                 line = line.strip().lstrip("0123456789.-) ").rstrip(".,;:")
                 if line and line.upper() != "NONE":
                     chosen_names.append(line)
-            # No [:k] limit — LLM decides how many are relevant
+            
+            print(f"[LLM Retriever] Parsed function names: {chosen_names}")
+            
+            # Filter to valid tools
             retrieved = [name_to_tool[n] for n in chosen_names if n in name_to_tool]
+            
+            print(f"[LLM Retriever] Valid tools found: {[t.get('function', {}).get('name', '?') for t in retrieved]}")
+            if len(chosen_names) != len(retrieved):
+                invalid = set(chosen_names) - set(name_to_tool.keys())
+                print(f"[LLM Retriever] WARNING: Invalid function names (not in pool): {invalid}")
+            
+            # If search_k > 0, ensure we return exactly k tools (or fewer if not enough)
+            if search_k > 0:
+                if len(retrieved) > search_k:
+                    # Take first k if LLM returned more than k
+                    retrieved = retrieved[:search_k]
+                # If LLM returned fewer than k, that's acceptable (not enough relevant tools)
+            
             if retrieved:
                 return retrieved
             # Empty or unparseable response — retry
@@ -278,7 +330,9 @@ def _llm_retrieve(
             print(f"[BFCLToolSearch/llm] LLM retrieval error after {max_retries} attempts: "
                   f"{e}, falling back to BM25")
 
-    return _bm25_retrieve(pool, query, k)
+    # Fallback to BM25: use search_k if >0, otherwise default to 4
+    fallback_k = search_k if search_k > 0 else 4
+    return _bm25_retrieve(pool, query, fallback_k)
 
 
 # ── BM25-style keyword retrieval ──────────────────────────────────

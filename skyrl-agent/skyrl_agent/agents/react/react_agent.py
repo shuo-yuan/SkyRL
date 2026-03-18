@@ -106,8 +106,7 @@ class ReActAgent:
         # bfcl_tool_search to retrieve tools before using them.
         self._bfcl_tool_search_enabled: bool = False
         self._bfcl_tool_pool: List[Dict] = []       # all available tools for this batch
-        self._bfcl_tool_search_k: int = 3           # k used as fallback inside _llm_retrieve
-        self._bfcl_bm25_k: int = 4                  # k specifically for BM25 retrieval
+        self._bfcl_search_k: int = 0                # search_k: 0 = LLM decides, >0 = return k tools (LLM only); for BM25 must be >0
         # Tools retrieved in the CURRENT task only (reset on task transition).
         # Used for parse-validation so the model cannot accidentally call a tool
         # from a prior task.  _active_bfcl_tool_params keeps the full history
@@ -893,8 +892,7 @@ class ReActAgent:
         instances: List[Dict],
         combined_tool_params: Optional[List[Dict]] = None,
         use_tool_search: bool = False,
-        tool_search_k: int = 3,
-        bm25_k: int = 4,
+        search_k: Optional[int] = None,
         tool_search_retrieval: str = "bm25",
         tool_search_llm_model: str = "gpt-5-nano",
         tool_search_llm_base_url: str = "https://api.openai.com/v1",
@@ -908,7 +906,9 @@ class ReActAgent:
             use_tool_search:          False (default) = all tools upfront (original behaviour).
                                       True = only bfcl_tool_search in system prompt; model
                                       must call it to retrieve tools.
-            tool_search_k:            Tools returned per search query (default 3).
+            search_k:                 If None, defaults to 4 for BM25, 0 for LLM.
+                                      For LLM retrieval: 0 = LLM decides how many,
+                                      >0 = return exactly k tools. For BM25: must be >0.
             tool_search_retrieval:    "bm25" (default) or "llm".
             tool_search_llm_model:    LLM model for retrieval (default "gpt-5-nano").
             tool_search_llm_base_url: Base URL for LLM retrieval API.
@@ -932,10 +932,22 @@ class ReActAgent:
         if use_tool_search:
             # Store all tools in the retrieval pool; start with empty active params.
             # The model must call bfcl_tool_search before using any tool.
+            # Set default search_k based on retrieval method
+            if search_k is None:
+                if tool_search_retrieval == "llm":
+                    search_k = 0  # LLM decides by default
+                else:
+                    search_k = 4  # BM25 default k=4
+            
+            # Validate search_k: only LLM retriever can have k==0
+            if search_k == 0 and tool_search_retrieval != "llm":
+                raise ValueError(f"search_k=0 is only allowed for LLM retrieval, but retrieval={tool_search_retrieval}")
+            if search_k < 0:
+                raise ValueError(f"search_k must be >= 0, got {search_k}")
+            
             self._bfcl_tool_search_enabled = True
             self._bfcl_tool_pool = list(all_tools)
-            self._bfcl_tool_search_k = tool_search_k
-            self._bfcl_bm25_k = bm25_k
+            self._bfcl_search_k = search_k
             # Retrieval settings read by BFCLToolSearchTool.call()
             self._bfcl_tool_search_retrieval = tool_search_retrieval
             self._bfcl_tool_search_llm_model = tool_search_llm_model
